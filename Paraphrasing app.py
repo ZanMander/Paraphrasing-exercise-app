@@ -1,12 +1,13 @@
-# app.py — Paraphrasing Practice (Streamlit) — full version
-# ---------------------------------------------------------
+# app.py — Paraphrasing Practice (Streamlit) — full version with Style Delta & target guidance
+# -------------------------------------------------------------------------------------------
 # - Similarity: Jaccard, Sørensen–Dice, Cosine (+ stopword ignore)
+# - Style difference: Burrows’s Delta (friendlier label + bands)
 # - Highlights (red=reused, green=unique)
-# - Readability & quality: Flesch, FK Grade, Fog, SMOG, ARI, avg sent len, % complex words, TTR, lexical density
+# - Readability & quality: Flesch, FK Grade, Fog, SMOG, ARI, avg sent len, % complex, TTR, lexical density
 # - Target bands + delta arrows (paraphrase vs original)
-# - On‑screen metrics: toggle between interactive table and compact Markdown
-# - Downloads: .txt summary + one‑click PDF (with highlights, metrics, targets/deltas, and Student/Module/Lecturer)
-# ---------------------------------------------------------
+# - On‑screen metrics: interactive table or compact Markdown (toggle)
+# - Downloads: .txt summary + one‑click PDF (with highlights, metrics, targets/deltas, meta fields)
+# -------------------------------------------------------------------------------------------
 
 import re
 import math
@@ -83,6 +84,41 @@ def cosine_similarity(a_tokens, b_tokens):
     b_norm = math.sqrt(sum(v*v for v in b_tf.values()))
     if a_norm == 0 or b_norm == 0: return 0.0
     return dot / (a_norm * b_norm)
+
+# -------------------------------
+# Burrows’s Delta (style difference)
+# -------------------------------
+def burrows_delta(orig_text: str, para_text: str, top_n: int = 150):
+    A = tokenize(orig_text); B = tokenize(para_text)
+    if not A or not B: return 0.0
+
+    def rel_freq(tokens):
+        c = Counter(tokens); n = len(tokens)
+        return {w: c[w]/n for w in c}
+
+    rfA, rfB = rel_freq(A), rel_freq(B)
+
+    # focus on frequent function words seen in either text
+    fw = [w for w in STOPWORDS if w in rfA or w in rfB]
+    fw.sort(key=lambda w: (rfA.get(w,0)+rfB.get(w,0)), reverse=True)
+    vocab = fw[:top_n] if fw else list({*rfA.keys(), *rfB.keys()})[:top_n]
+
+    zsA, zsB = [], []
+    for w in vocab:
+        a, b = rfA.get(w, 0.0), rfB.get(w, 0.0)
+        mu = (a + b) / 2.0
+        sd = math.sqrt(((a - mu)**2 + (b - mu)**2) / 2.0)
+        sd = sd if sd > 1e-9 else 1e-9
+        zsA.append((a - mu) / sd)
+        zsB.append((b - mu) / sd)
+
+    delta = sum(abs(x - y) for x, y in zip(zsA, zsB)) / max(1, len(vocab))
+    return delta
+
+def interpret_delta(delta: float):
+    if delta < 1.0:   return "Close style",   "🟢"
+    if delta < 2.0:   return "Moderate diff", "🟡"
+    return "Far style", "🔴"
 
 # -------------------------------
 # Highlighting (HTML)
@@ -202,7 +238,7 @@ def delta_eval(name, orig, para):
         diff = para - orig
     return diff, verdict
 
-def arrow(verdict):  # text arrow for both on‑screen and PDF
+def arrow(verdict):
     return "▲" if verdict == "better" else ("▼" if verdict == "worse" else "🟰")
 
 # -------------------------------
@@ -217,11 +253,21 @@ def explain_metrics(jacc, dice, cos):
         f"**Cosine {pct(cos)}** – overlap of **word‑frequency distributions**; independent of length."
     )
 
+TARGET_GUIDE = """
+**What the targets mean (and how to hit them)**
+
+- **Flesch Reading Ease (50–70)** → Clear academic prose. *Raise it* by shortening sentences and using plainer wording.
+- **FK Grade / Fog / SMOG / ARI (≈8–12)** → Typical tertiary audience. *Nudge toward band* by trimming long sentences and heavy nominalisations.
+- **Avg sentence length (15–22 words)** → Mix short and medium sentences. *Fix* run-ons and break complex ideas into steps.
+- **% complex words (10–15%)** → Keep jargon purposeful. *Reduce* multi‑syllable words when simpler synonyms exist.
+- **TTR (40–60%)** → Balance variety and cohesion. *Improve* by avoiding repetition while keeping key terms consistent.
+- **Lexical density (45–55%)** → Balance content and function words. *Adjust* with signposting and transitions if density is too high.
+"""
+
 # -------------------------------
 # PDF report (ReportLab)
 # -------------------------------
 def make_paraphrase_markup_for_pdf(original_tokens, paraphrase_text):
-    """Return Paragraph-markup with coloured words (red reused, green unique)."""
     orig_set = set(original_tokens)
     parts = re.findall(r"\b[\w'-]+\b|\s+|[^\w\s]", paraphrase_text)
     out = []
@@ -234,7 +280,7 @@ def make_paraphrase_markup_for_pdf(original_tokens, paraphrase_text):
             out.append(f"<font color='{color}'>{safe}</font>")
     return "".join(out)
 
-def build_pdf_bytes(orig_text, para_text, jacc, dice, cos, orig_read, para_read, original_tokens,
+def build_pdf_bytes(orig_text, para_text, jacc, dice, cos, delta_val, orig_read, para_read, original_tokens,
                     student_name, module, lecturer):
     try:
         from reportlab.lib.pagesizes import A4
@@ -265,27 +311,27 @@ def build_pdf_bytes(orig_text, para_text, jacc, dice, cos, orig_read, para_read,
     story.append(Paragraph(meta, Body))
     story.append(Spacer(1, 6))
 
-    # Similarity row
-    sim_row = [[Paragraph(f"<b>Jaccard</b>: {round(jacc*100)}%", Body),
-                Paragraph(f"<b>Sørensen–Dice</b>: {round(dice*100)}%", Body),
-                Paragraph(f"<b>Cosine</b>: {round(cos*100)}%", Body)]]
-    story.append(Table(sim_row, colWidths=[150, 180, 150]))
+    delta_label, _ = interpret_delta(delta_val)
+    sim_row = [[
+        Paragraph(f"<b>Jaccard</b>: {round(jacc*100)}%", Body),
+        Paragraph(f"<b>Sørensen–Dice</b>: {round(dice*100)}%", Body),
+        Paragraph(f"<b>Cosine</b>: {round(cos*100)}%", Body),
+        Paragraph(f"<b>Style difference (Burrows’s Δ)</b>: {delta_val:.2f} — {delta_label}", Body)
+    ]]
+    story.append(Table(sim_row, colWidths=[120, 140, 120, 180]))
     story.append(Spacer(1, 8))
 
-    # Original
     esc = lambda s: (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
     story.append(Paragraph("Original text", H2))
     story.append(Paragraph(esc(orig_text), Mono))
     story.append(Spacer(1, 8))
 
-    # Paraphrase (coloured words)
     story.append(Paragraph("Paraphrased text (colour shows reuse vs unique words)", H2))
     story.append(Paragraph(make_paraphrase_markup_for_pdf(original_tokens, para_text), Body))
     story.append(Paragraph("Legend: <font color='#c40000'>red</font> = also appears in original; "
                            "<font color='#0a7c00'>green</font> = unique to paraphrase.", Body))
     story.append(Spacer(1, 8))
 
-    # Explanation
     expl = explain_metrics(jacc, dice, cos).replace("**","").replace("  \n","<br/>")
     story.append(Paragraph("How to read the similarity scores", H2))
     story.append(Paragraph(expl, Body))
@@ -297,7 +343,7 @@ def build_pdf_bytes(orig_text, para_text, jacc, dice, cos, orig_read, para_read,
         o = orig_read[name]; p = para_read[name]
         diff, v = delta_eval(name, o, p)
         lo, hi, _ = TARGETS[name]
-        return [disp, f"{o:.1f}", f"{p:.1f}", f"{diff:+.1f} {arrow(v)}", f"{lo:.0f}–{hi:.0f}"]
+        return [disp, f"{o:.1f}", f"{p:.1f}", f"{diff:+.1f} {('▲' if v=='better' else '▼' if v=='worse' else '🟰')}", f"{lo:.0f}–{hi:.0f}"]
 
     left_names = ["flesch","fk_grade","avg_sentence_len","pct_complex_words"]
     right_names = ["fog","smog","ari","ttr","lex_density"]
@@ -318,7 +364,9 @@ def build_pdf_bytes(orig_text, para_text, jacc, dice, cos, orig_read, para_read,
     story.append(Paragraph("Readability & quality (targets and changes)", H2))
     story.append(table_for(left_names)); story.append(Spacer(1, 6))
     story.append(table_for(right_names)); story.append(Spacer(1, 6))
-    story.append(Paragraph("Notes: targets are heuristic bands for undergrad academic prose. Use judgement.", Body))
+
+    story.append(Paragraph("Targets & how to reach them", H2))
+    story.append(Paragraph(TARGET_GUIDE.replace("**","").replace("—","-").replace("–","-").replace("  \n","<br/>"), Body))
 
     doc.build(story)
     return buf.getvalue(), None
@@ -331,7 +379,7 @@ st.title("Paraphrasing Practice – Streamlit Edition")
 st.markdown(
     "Paste the original text on the left and your paraphrase on the right. "
     "Toggle **Ignore stopwords** to focus similarity on content words. "
-    "Evaluate to see similarity, highlights, readability, targets, deltas, and download a PDF."
+    "Evaluate to see similarity, style difference, highlights, readability, targets, deltas, and download a PDF."
 )
 st.markdown(CSS, unsafe_allow_html=True)
 
@@ -347,9 +395,9 @@ with colA: orig_text = st.text_area("Original text", height=220, key="orig")
 with colB: para_text = st.text_area("Your paraphrase", height=220, key="para")
 
 # Options
-opts_l, _ = st.columns([1,3])
-with opts_l: view_df = st.checkbox("View metrics as interactive table", value=True)
-ignore_sw = st.checkbox("Ignore stopwords for similarity", value=True)
+opt1, opt2, _ = st.columns([2,3,3])
+with opt1: view_df = st.checkbox("View metrics as interactive table", value=True)
+with opt2: ignore_sw = st.checkbox("Ignore stopwords for similarity", value=True)
 
 # Evaluate
 if st.button("Evaluate", type="primary"):
@@ -372,6 +420,16 @@ if st.button("Evaluate", type="primary"):
     c2.metric("Sørensen–Dice (weighted overlap)", f"{round(dice*100)}%")
     c3.metric("Cosine (term‑frequency overlap)", f"{round(cos*100)}%")
 
+    # Style difference (Burrows’s Delta)
+    delta_val = burrows_delta(orig_text, para_text)
+    delta_label, delta_icon = interpret_delta(delta_val)
+    st.markdown(
+        f"**Writing style difference (Burrows’s Δ):** {delta_icon} **{delta_val:.2f}** "
+        f"<span class='tiny'>(lower = more similar style)</span> — {delta_label}",
+        unsafe_allow_html=True
+    )
+    st.caption("This compares function‑word usage patterns. 🟢 close (<1.0), 🟡 moderate (1.0–2.0), 🔴 far (>2.0).")
+
     # Band feedback (based on Jaccard)
     if jacc < 0.20:
         st.success("Low lexical overlap — good paraphrasing! Check meaning is preserved.")
@@ -383,7 +441,7 @@ if st.button("Evaluate", type="primary"):
     # Explanation
     st.markdown(explain_metrics(jacc, dice, cos))
 
-    # Highlights (use unfiltered original tokens)
+    # Highlights
     st.subheader("Paraphrase with highlights")
     st.caption("Words in red also appear in the original; words in green are unique to your paraphrase.")
     highlighted_html = highlight_paraphrase(tokenize(orig_text), para_text)
@@ -399,7 +457,6 @@ if st.button("Evaluate", type="primary"):
         "avg_sentence_len","pct_complex_words","ttr","lex_density"
     ]
 
-    # Build rows for table
     rows = []
     for name in metrics_order:
         o = float(orig[name]); p = float(para[name])
@@ -422,7 +479,6 @@ if st.button("Evaluate", type="primary"):
     if view_df:
         st.dataframe(df, use_container_width=True)
     else:
-        # Compact Markdown version
         md = []
         md.append("| Metric | Original | Paraphrase | Δ | Verdict | Target | In target? |")
         md.append("|---|---:|---:|:--:|:--:|:--:|:--:|")
@@ -433,6 +489,10 @@ if st.button("Evaluate", type="primary"):
             )
         st.markdown("\n".join(md))
     st.caption("Legend: ▲ better, ▼ worse, 🟰 no change. Targets are heuristic bands for undergrad academic prose; always favour clarity and your discipline’s conventions.")
+
+    # Target guidance (what/why/how)
+    st.subheader("Targets: what they mean & how to achieve them")
+    st.markdown(TARGET_GUIDE)
 
     # ---------------------------
     # Downloads
@@ -446,14 +506,15 @@ if st.button("Evaluate", type="primary"):
     if module: txt.write(f"Module: {module}\n")
     if lecturer: txt.write(f"Lecturer: {lecturer}\n")
     txt.write(f"Ignore stopwords: {ignore_sw}\n")
-    txt.write(f"Jaccard: {round(jacc*100)}%\nSørensen–Dice: {round(dice*100)}%\nCosine: {round(cos*100)}%\n\n")
+    txt.write(f"Jaccard: {round(jacc*100)}%\nSørensen–Dice: {round(dice*100)}%\nCosine: {round(cos*100)}%\n")
+    txt.write(f"Style difference (Burrows's Delta): {delta_val:.2f} ({delta_label})\n\n")
     txt.write("Original:\n" + orig_text + "\n\nParaphrase:\n" + para_text + "\n")
     st.download_button("Download as .txt", data=txt.getvalue().encode("utf-8"),
                        file_name="paraphrase_attempt.txt", mime="text/plain")
 
     # PDF report
     pdf_bytes, pdf_err = build_pdf_bytes(
-        orig_text, para_text, jacc, dice, cos, orig, para, tokenize(orig_text),
+        orig_text, para_text, jacc, dice, cos, delta_val, orig, para, tokenize(orig_text),
         student_name, module, lecturer
     )
     if pdf_bytes:
@@ -464,3 +525,4 @@ if st.button("Evaluate", type="primary"):
 
 else:
     st.caption("Enter your texts, add optional student/module/lecturer, and click **Evaluate**.")
+
